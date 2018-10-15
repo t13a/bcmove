@@ -19,6 +19,7 @@ function check_vars() {
     BACKUP_SSH_OPTION_STRICT_HOST_KEY_CHECKING \
     BACKUP_SSH_PORT \
     BACKUP_SSH_USER \
+    IGNORE_REGEX \
     TARGET_DIRS
 
     if [ -n "${PROMETHEUS_ENABLED:-}" ]
@@ -206,11 +207,13 @@ SOURCE_ROOT="${BACKUP_SOURCE_ROOT}"
 TARGET_DIRS=(
 $(echo "${TARGET_DIRS}" | tr "${TARGET_DIRS_DELIM}" \\n | sed "s/^\\(.*\\)$/    '\\1'/g" )
 )
+IGNORE_REGEX='${IGNORE_REGEX}'
 
 for TARGET_DIR in "\${TARGET_DIRS[@]}"
 do
     sudo find "\${SOURCE_ROOT}/\${TARGET_DIR}" -type f |
-    sed "s/^.\{\$((\${#SOURCE_ROOT} + 1))\}//g" || true
+    sed "s/^.\{\$((\${#SOURCE_ROOT} + 1))\}//g" |
+    grep -Ev "\${IGNORE_REGEX}" || true
 done
 EOF
 }
@@ -357,6 +360,7 @@ default_var ACTIVE_SSH_PORT 22
 default_var BACKUP_SSH_OPTION_CONTROL_PERSIST 3600
 default_var BACKUP_SSH_OPTION_STRICT_HOST_KEY_CHECKING no # XXX
 default_var BACKUP_SSH_PORT 22
+default_var IGNORE_REGEX '^$'
 default_var TARGET_DIRS_DELIM ,
 
 case "${1:-}" in

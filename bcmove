@@ -1,0 +1,370 @@
+#!/bin/bash
+
+set -euo pipefail
+
+function check_vars() {
+    exists_vars \
+    ACTIVE_ORIGIN_ROOT \
+    ACTIVE_SSH_HOST \
+    ACTIVE_SSH_IDENTITY \
+    ACTIVE_SSH_OPTION_CONTROL_PERSIST \
+    ACTIVE_SSH_OPTION_STRICT_HOST_KEY_CHECKING \
+    ACTIVE_SSH_PORT \
+    ACTIVE_SSH_USER \
+    BACKUP_DEST_ROOT \
+    BACKUP_SOURCE_ROOT \
+    BACKUP_SSH_HOST \
+    BACKUP_SSH_IDENTITY \
+    BACKUP_SSH_OPTION_CONTROL_PERSIST \
+    BACKUP_SSH_OPTION_STRICT_HOST_KEY_CHECKING \
+    BACKUP_SSH_PORT \
+    BACKUP_SSH_USER \
+    TARGET_DIRS
+
+    if [ -n "${PROMETHEUS_ENABLED:-}" ]
+    then
+        exists_vars \
+        PROMETHEUS_CONTROLLER \
+        PROMETHEUS_INSTANCE \
+        PROMETHEUS_JOB \
+        PROMETHEUS_PUSHGATEWAY_CA_CERT \
+        PROMETHEUS_PUSHGATEWAY_URL
+    fi
+}
+
+function cron() {
+
+    function push_metrics() {
+        [ -n "${PROMETHEUS_ENABLED:-}" ] || return 0
+
+        if run_or_dry_run curl \
+        --cacert "${PROMETHEUS_PUSHGATEWAY_CA_CERT}" \
+        --data-binary \
+        @- \
+        "${PROMETHEUS_PUSHGATEWAY_URL}/metrics/job/${PROMETHEUS_JOB}/controller/${PROMETHEUS_CONTROLLER}"
+        then
+            print_stderr "Pushed metrics"
+        else
+            print_stderr "Failed to push metrics, but continue"
+        fi
+    }
+
+    function push_metrics_begin() {
+        [ -n "${PROMETHEUS_ENABLED:-}" ] || return 0
+
+        push_metrics << EOF
+# HELP bcmove_begin_time bcmove begin time, in unixtime.
+# TYPE bcmove_begin_time gauge
+bcmove_begin_time{instance="${PROMETHEUS_INSTANCE}"} $(date +%s)
+EOF
+    }
+
+    function push_metrics_end() {
+        [ -n "${PROMETHEUS_ENABLED:-}" ] || return 0
+
+        push_metrics << EOF
+# HELP bcmove_end_time bcmove end time, in unixtime.
+# TYPE bcmove_end_time gauge
+bcmove_end_time{instance="${PROMETHEUS_INSTANCE}"} $(date +%s)
+# HELP bcmove_end_status bcmove end status, 0 in success, otherwise in failure.
+# TYPE bcmove_end_status gauge
+bcmove_end_status{instance="${PROMETHEUS_INSTANCE}"} ${1}
+EOF
+    }
+
+    function terminate() {
+        local status=$?
+
+        push_metrics_end "${status}"
+        return ${status}
+    }
+
+    trap 'terminate' EXIT INT TERM
+    push_metrics_begin
+    check_vars
+
+    gen_list | ssh_backup | while read file
+    do
+        if sha256sum="$(gen_copy "${file}" | ssh_backup)"
+        then
+            gen_remove "${file}" "${sha256sum}" | ssh_active || true
+        fi
+    done
+
+    gen_remove_empty_dirs | ssh_active || true
+}
+
+function default_var() {
+    [ -n "${!1:-}" ] || declare -g "${1}=${2}"
+}
+
+function exists_vars() {
+    local empty_vars=0
+
+    for var_name in "${@}"
+    do
+        if [ -z "${!var_name:-}" ]
+        then
+            empty_vars=$((${empty_vars} + 1))
+            print_stderr "${var_name}=${!var_name:-}"
+        fi
+    done
+
+    if [ ${empty_vars} -eq 0 ]
+    then
+        return 0
+    else
+        print_stderr "${empty_vars} empty var(s) found"
+        return 1
+    fi
+}
+
+function gen_copy() {
+    cat << EOF
+set -euo pipefail
+
+function copy_recursively() {
+    local file="\${1}"
+    local dir="\$(dirname "\${file}")"
+
+    if [ "\${dir}" != . -a ! -e "\${DEST_ROOT}/\${dir}" ]
+    then
+        copy_recursively "\${dir}"
+    fi
+
+    local source="\${SOURCE_ROOT}/\${file}"
+    local dest="\${DEST_ROOT}/\${file}"
+
+    if [ -d "\${source}" ]
+    then
+        local source_group="\$(stat -c %g "\${source}")"
+        local source_mode="\$(stat -c %a "\${source}")"
+        local source_owner="\$(stat -c %u "\${source}")"
+
+        run_or_dry_run sudo mkdir -m "\${source_mode}" "\${dest}"
+        run_or_dry_run sudo chown "\${source_owner}:\${source_group}" "\${dest}"
+    else
+        run_or_dry_run sudo cp -p "\${source}" "\${dest}"
+    fi
+}
+
+function gen_sha256sum() {
+    if [ -z "\${DRY_RUN}" ]
+    then
+        sudo sha256sum "\${1}" | grep -o '^\\w*'
+    else
+        echo 0000000000000000000000000000000000000000000000000000000000000000
+    fi
+}
+
+function run_or_dry_run() {
+    if [ -z "\${DRY_RUN}" ]
+    then
+        "\${@}"
+    else
+        echo "[DEBUG] \${@}" >&2
+    fi
+}
+
+DRY_RUN="${DRY_RUN:+yes}"
+SOURCE_ROOT="${BACKUP_SOURCE_ROOT}"
+DEST_ROOT="${BACKUP_DEST_ROOT}"
+FILE="${1}"
+
+if [ ! -e "\${SOURCE_ROOT}/\${FILE}" ]
+then
+    echo "[ERROR] \${FILE}: file not found" >&2
+    exit 1
+fi
+
+if [ ! -e "\${DEST_ROOT}/\${FILE}" ]
+then
+    copy_recursively "\${FILE}" >&2
+    echo "[INFO] \${FILE}: file copied" >&2
+else
+    echo "[DEBUG] \${FILE}: file already exists" >&2
+fi
+
+SOURCE_SHA256SUM="\$(gen_sha256sum "\${SOURCE_ROOT}/\${FILE}")"
+DEST_SHA256SUM="\$(gen_sha256sum "\${DEST_ROOT}/\${FILE}")"
+
+if [ "\${SOURCE_SHA256SUM}" != "\${DEST_SHA256SUM}" ]
+then
+    echo "[ERROR] \${FILE}: file not matched" >&2
+    exit 1
+fi
+
+echo "\${SOURCE_SHA256SUM}"
+EOF
+}
+
+function gen_list() {
+    cat << EOF
+set -euo pipefail
+
+SOURCE_ROOT="${BACKUP_SOURCE_ROOT}"
+TARGET_DIRS=(
+$(echo "${TARGET_DIRS}" | tr "${TARGET_DIRS_DELIM}" \\n | sed "s/^\\(.*\\)$/    '\\1'/g" )
+)
+
+for TARGET_DIR in "\${TARGET_DIRS[@]}"
+do
+    sudo find "\${SOURCE_ROOT}/\${TARGET_DIR}" -type f |
+    sed "s/^.\{\$((\${#SOURCE_ROOT} + 1))\}//g" || true
+done
+EOF
+}
+
+function gen_remove() {
+    cat << EOF
+set -euo pipefail
+
+function gen_sha256sum() {
+    if [ -z "\${DRY_RUN}" ]
+    then
+        sudo sha256sum "\${1}" | grep -o '^\\w*'
+    else
+        echo 0000000000000000000000000000000000000000000000000000000000000000
+    fi
+}
+
+function run_or_dry_run() {
+    if [ -z "\${DRY_RUN}" ]
+    then
+        "\${@}"
+    else
+        echo "[DEBUG] \${@}" >&2
+    fi
+}
+
+DRY_RUN="${DRY_RUN:+yes}"
+ORIGIN_ROOT="${ACTIVE_ORIGIN_ROOT}"
+FILE="${1}"
+FILE_SHA256SUM="${2}"
+ORIGIN="\${ORIGIN_ROOT}/\${FILE}"
+
+if [ ! -e "\${ORIGIN}" ]
+then
+    echo "[DEBUG] \${FILE}: origin already removed" >&2
+    exit 0
+fi
+
+ORIGIN_SHA256SUM="\$(gen_sha256sum "\${ORIGIN}")"
+
+if [ "\${ORIGIN_SHA256SUM}" != "\${FILE_SHA256SUM}" ]
+then
+    echo "[ERROR] \${FILE}: origin not matched" >&2
+    exit 1
+fi
+
+run_or_dry_run sudo rm "\${ORIGIN}"
+echo "[INFO] \${FILE}: origin removed" >&2
+EOF
+}
+
+function gen_remove_empty_dirs() {
+    cat << EOF
+set -euo pipefail
+
+function run_or_dry_run() {
+    if [ -z "\${DRY_RUN}" ]
+    then
+        "\${@}"
+    else
+        echo "[DEBUG] \${@}" >&2
+    fi
+}
+
+DRY_RUN="${DRY_RUN:+yes}"
+ORIGIN_ROOT="${ACTIVE_ORIGIN_ROOT}"
+TARGET_DIRS=(
+$(echo "${TARGET_DIRS}" | tr "${TARGET_DIRS_DELIM}" \\n | sed "s/^\\(.*\\)$/    '\\1'/g" )
+)
+
+for TARGET_DIR in "\${TARGET_DIRS[@]}"
+do
+    sudo find "\${ORIGIN_ROOT}/\${TARGET_DIR}" -mindepth 1 -type d |
+    sort -r |
+    while read dir
+    do
+        if run_or_dry_run sudo rmdir --ignore-fail-on-non-empty "\${dir}"
+        then
+            echo "[INFO] \${dir#\${ORIGIN_ROOT}/}: origin's directory removed" >&2
+        fi
+    done || true
+done
+EOF
+}
+
+function help() {
+    cat << EOF
+${0} SUBCOMMAND
+
+Subcommands:
+    check-vars                    check variables
+    cron                          run
+    gen-copy FILE                 generate script for copy target
+    gen-list                      generate script for list targets
+    gen-remove FILE SHA256SUM     generate script for remove origin
+    gen-remove-empty_dirs         generate script for remove origin's empty directories
+    ssh-active [CMD] [ARG]...     run command in active
+    ssh-backup [CMD] [ARG]...     run command in backup
+EOF
+}
+
+function print_stderr() {
+    echo "$(hostname):" "$(basename "${BASH_SOURCE[0]}"):" "${@}" >&2
+}
+
+function run_or_dry_run() {
+    if [ -z "${DRY_RUN:-}" ]
+    then
+        "${@}"
+    else
+        echo "[DEBUG] ${@}" >&2
+    fi
+}
+
+function ssh_active() {
+    ssh \
+    -i "${ACTIVE_SSH_IDENTITY}" \
+    -o "ControlMaster=auto" \
+    -o "ControlPath=/dev/shm/active-%r@%h:%p" \
+    -o "ControlPersist=${ACTIVE_SSH_OPTION_CONTROL_PERSIST}" \
+    -o "StrictHostKeyChecking=${ACTIVE_SSH_OPTION_STRICT_HOST_KEY_CHECKING}" \
+    -p "${ACTIVE_SSH_PORT}" \
+    -T \
+    "${ACTIVE_SSH_USER}@${ACTIVE_SSH_HOST}" \
+    "${@}"
+}
+
+function ssh_backup() {
+    ssh \
+    -i "${BACKUP_SSH_IDENTITY}" \
+    -o "ControlMaster=auto" \
+    -o "ControlPath=/dev/shm/backup-%r@%h:%p" \
+    -o "ControlPersist=${BACKUP_SSH_OPTION_CONTROL_PERSIST}" \
+    -o "StrictHostKeyChecking=${BACKUP_SSH_OPTION_STRICT_HOST_KEY_CHECKING}" \
+    -p "${BACKUP_SSH_PORT}" \
+    -T \
+    "${BACKUP_SSH_USER}@${BACKUP_SSH_HOST}" \
+    "${@}"
+}
+
+default_var ACTIVE_SSH_OPTION_CONTROL_PERSIST 3600
+default_var ACTIVE_SSH_OPTION_STRICT_HOST_KEY_CHECKING no # XXX
+default_var ACTIVE_SSH_PORT 22
+default_var BACKUP_SSH_OPTION_CONTROL_PERSIST 3600
+default_var BACKUP_SSH_OPTION_STRICT_HOST_KEY_CHECKING no # XXX
+default_var BACKUP_SSH_PORT 22
+default_var TARGET_DIRS_DELIM ,
+
+case "${1:-}" in
+    check-*|cron|gen-*|ssh-*)
+        "${1//-/_}" "${@:2}"
+        ;;
+    *)
+        help
+        exit 1
+        ;;
+esac
